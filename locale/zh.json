@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "交易中控台 (Trading Cockpit)",
+    "description": "查询《执行手册》规则、按截图记录当日交易，并在 K 线上标记开平仓。"
+  }
+}
