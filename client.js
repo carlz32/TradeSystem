@@ -189,6 +189,52 @@ window.__ModuleLoader__.load({
       });
     }
 
+    function colorLuminance(value) {
+      const text = String(value || '').trim();
+      const hex = /^#([0-9a-f]{3,8})$/i.exec(text);
+      if (hex) {
+        let digits = hex[1];
+        if (digits.length === 3) digits = digits.split('').map((part) => part + part).join('');
+        if (digits.length >= 6) {
+          const number = Number.parseInt(digits.slice(0, 6), 16);
+          const red = (number >> 16) & 0xff;
+          const green = (number >> 8) & 0xff;
+          const blue = number & 0xff;
+          return (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+        }
+      }
+      const rgb = /^rgba?\(([^)]+)\)/i.exec(text);
+      if (rgb) {
+        const parts = rgb[1].split(',').map((part) => Number.parseFloat(part.trim()));
+        if (parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite)) {
+          return (0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]) / 255;
+        }
+      }
+      return null;
+    }
+
+    function detectScheme() {
+      try {
+        const root = document.documentElement;
+        const token = window.getComputedStyle(root).getPropertyValue('--dsw-alias-bg-base');
+        const luminance = colorLuminance(token);
+        if (luminance !== null) return luminance < 0.45 ? 'dark' : 'light';
+        for (const element of [root, document.body]) {
+          if (!element) continue;
+          const marker = [
+            String(element.className?.baseVal ?? element.className ?? ''),
+            element.getAttribute('data-theme') ?? '',
+            element.getAttribute('data-scheme') ?? '',
+          ].join(' ');
+          if (/\bdark\b/i.test(marker)) return 'dark';
+          if (/\blight\b/i.test(marker)) return 'light';
+        }
+      } catch {
+        // Fall through to the media query when the host exposes no usable color.
+      }
+      return typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+
     function nearestBar(bars, iso) {
       const target = Date.parse(iso);
       if (!Array.isArray(bars) || bars.length === 0 || !Number.isFinite(target)) return -1;
@@ -1253,6 +1299,7 @@ window.__ModuleLoader__.load({
       const [stats, setStats] = useState(null);
       const [dictOpen, setDictOpen] = useState(null);
       const [palette, setPalette] = useState(readPalette);
+      const [scheme, setScheme] = useState(detectScheme);
       const [uploading, setUploading] = useState(false);
       const [clock, setClock] = useState(() => currentClock());
       const [decision, setDecision] = useState({
@@ -1276,6 +1323,23 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         savePalette(palette);
       }, [palette]);
+
+      useEffect(() => {
+        const sync = () => setScheme(detectScheme());
+        sync();
+        const Observer = window.MutationObserver;
+        if (!Observer) return undefined;
+        const observer = new Observer(sync);
+        const options = { attributes: true, attributeFilter: ['class', 'style', 'data-theme', 'data-scheme'] };
+        observer.observe(document.documentElement, options);
+        if (document.body) observer.observe(document.body, options);
+        const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+        media?.addEventListener?.('change', sync);
+        return () => {
+          observer.disconnect();
+          media?.removeEventListener?.('change', sync);
+        };
+      }, []);
 
       useEffect(() => {
         if (!toast) return undefined;
@@ -1457,7 +1521,7 @@ window.__ModuleLoader__.load({
       const live = !session?.tradingDay || day === session.tradingDay;
       const symbolOptions = Array.from(new Set([...SYMBOLS, ...trades.map((trade) => trade.symbol).filter(Boolean), symbol, form.symbol].filter(Boolean)));
 
-      return h('div', { className: 'tc-root', 'data-palette': palette },
+      return h('div', { className: 'tc-root', 'data-palette': palette, 'data-scheme': scheme },
         h('header', { className: 'tc-top' },
           h('div', { className: 'tc-brand' },
             h('span', { className: 'tc-logo' }),
@@ -1522,6 +1586,32 @@ window.__ModuleLoader__.load({
     const CSS = `
 .tc-root{height:100%;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);overflow:auto;font-size:13px;line-height:1.55}
 .tc-root *{box-sizing:border-box}
+/* Sample palette — values copied from docs/mock/index.html. The DSH aliases
+   below are only the fallback when a host element cannot expose its scheme. */
+.tc-root[data-scheme="light"]{
+  --tc-paper:#fafaf8;--tc-paper-2:#f2f2f0;--tc-ground:#f0f0ee;--tc-ink:#0a0a0a;
+  --tc-t2:#525252;--tc-t3:#767674;--tc-line:#d4d4d2;--tc-line-2:#e2e2e0;
+  --tc-accent:#002fa7;--tc-green:#147a4a;--tc-red:#b42318;--tc-warn:#8a5a00;
+}
+.tc-root[data-scheme="dark"]{
+  --tc-paper:#171717;--tc-paper-2:#1f1f1e;--tc-ground:#0e0e0d;--tc-ink:#f2f2f0;
+  --tc-t2:#b0b0ad;--tc-t3:#8a8a87;--tc-line:#3a3a38;--tc-line-2:#2a2a28;
+  --tc-accent:#7d9bff;--tc-green:#3fbf7f;--tc-red:#ff6b5e;--tc-warn:#d5a13a;
+}
+.tc-root[data-scheme]{
+  --dsw-alias-bg-base:var(--tc-ground);
+  --dsw-alias-bg-layer-1:var(--tc-paper);
+  --dsw-alias-bg-layer-2:var(--tc-paper-2);
+  --dsw-alias-bg-overlay:var(--tc-paper-2);
+  --dsw-alias-border-l1:var(--tc-line);
+  --dsw-alias-border-l2:var(--tc-line);
+  --dsw-alias-label-primary:var(--tc-ink);
+  --dsw-alias-label-secondary:var(--tc-t2);
+  --dsw-alias-brand-primary:var(--tc-accent);
+  --dsw-alias-state-success-primary:var(--tc-green);
+  --dsw-alias-state-error-primary:var(--tc-red);
+  --dsw-alias-state-warn-primary:var(--tc-warn);
+}
 .tc-top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;height:48px;padding:0 20px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
 .tc-brand{display:flex;align-items:center;gap:8px;font-size:13px}
 .tc-brand b{font-weight:600;letter-spacing:.01em}

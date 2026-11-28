@@ -177,3 +177,40 @@
 
 - 具体合约（如 PP2601）在数据源换月后没有当日分钟线，会显示空图；看盘用主力连续（PP0）。
 - 不使用 `dsh web` 时会话无鉴权 URL，真实 GUI 检查需通过桌面窗口或带 token 的 URL。
+
+---
+
+## 8. 样张配色皮肤（2026-11-28 晚）
+
+此前插件全部取 `--dsw-alias-*`，与样张写死的调色板在明暗两套下都对不上。v13 把样张配色内嵌为插件皮肤，DSH token 只作兜底。
+
+### 调色板
+
+| 变量 | 浅色 | 深色 |
+| --- | --- | --- |
+| `--tc-paper` | `#fafaf8` | `#171717` |
+| `--tc-paper-2` | `#f2f2f0` | `#1f1f1e` |
+| `--tc-ground` | `#f0f0ee` | `#0e0e0d` |
+| `--tc-ink` | `#0a0a0a` | `#f2f2f0` |
+| `--tc-t2` | `#525252` | `#b0b0ad` |
+| `--tc-t3` | `#767674` | `#8a8a87` |
+| `--tc-line` | `#d4d4d2` | `#3a3a38` |
+| `--tc-line-2` | `#e2e2e0` | `#2a2a28` |
+| `--tc-accent` | `#002fa7` | `#7d9bff` |
+| `--tc-green` | `#147a4a` | `#3fbf7f` |
+| `--tc-red` | `#b42318` | `#ff6b5e` |
+| `--tc-warn` | `#8a5a00` | `#d5a13a` |
+
+### 实现
+
+- `.tc-root[data-scheme]` 把上面 12 个变量映射到 `--dsw-alias-bg-base / layer-1 / layer-2 / bg-overlay / border-l1 / border-l2 / label-primary / label-secondary / brand-primary / state-success / state-error / state-warn`。原有全部 `var(--dsw-alias-*)`（含 SVG K 线、弹窗、按钮、规则/决策两栏）自动落到样张色。
+- `detectScheme()` 先读宿主 `--dsw-alias-bg-base` 的亮度（<0.45 深色），再查 `html/body` 的 class / `data-theme` / `data-scheme`，最后回退 `prefers-color-scheme`；`MutationObserver` 监听主题切换。
+- 找不到宿主颜色时，`data-scheme` 缺失，别名不被覆盖，继续用 DSH token 兜底。
+- `[data-palette="cn"]` 只交换 `--tc-up/--tc-down`；K 线、开平标记、涨跌数字跟随，状态色（通过/拦截）不翻。
+
+### 验证
+
+- `node --check client.js lib/index.js` 通过；`node --test test/core.test.js` 15/15。
+- jsdom 下 `data-theme=dark → light`，`.tc-root[data-scheme]` 随之切换。
+- 真实 GUI（临时鉴权 URL）：深色 `backgroundColor: rgb(14, 14, 13)`、面板 `#171717`、强调色 `#7d9bff`；模拟浅色宿主后 `rgb(240, 240, 238)`、面板 `#fafaf8`、强调色 `#002fa7`，与样张一致。
+- 临时鉴权代码与 `/tmp/dsh-trading-cockpit-url.txt` 已删除并 reload。
