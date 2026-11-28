@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-    const { useEffect, useMemo, useState } = React;
+    const { useEffect, useMemo, useRef, useState } = React;
 
     const ID = 'dsh-trading-cockpit';
     const API = '/trading-cockpit/api';
@@ -122,8 +122,27 @@ window.__ModuleLoader__.load({
       return MULTIPLIERS[String(symbol || '').replace(/[^A-Za-z]/g, '').toUpperCase()] ?? 10;
     }
 
+    const PALETTE_KEY = 'dsh-trading-cockpit.palette';
+
+    function readPalette() {
+      try {
+        return window.localStorage.getItem(PALETTE_KEY) === 'cn' ? 'cn' : 'intl';
+      } catch {
+        return 'intl';
+      }
+    }
+
+    function savePalette(value) {
+      try {
+        window.localStorage.setItem(PALETTE_KEY, value);
+      } catch {
+        /* private mode: keep the in-memory choice */
+      }
+    }
+
     function emptyForm(symbol = 'PP0') {
       return {
+        symbol,
         direction: 'long',
         entryTime: nowLocalInput(),
         entryPrice: '',
@@ -135,7 +154,10 @@ window.__ModuleLoader__.load({
         exitPrice: '',
         state15m: 'trend',
         pattern: '',
+        errors: [],
         note: '',
+        shot: '',
+        shotPreview: '',
       };
     }
 
@@ -153,9 +175,18 @@ window.__ModuleLoader__.load({
         closedAt: form.exitTime ? toIsoInput(form.exitTime) : null,
         exitPrice: form.exitPrice === '' ? null : Number(form.exitPrice),
         note: form.note,
-        source: 'manual',
-        extended: { state15m: form.state15m, pattern: form.pattern },
+        source: form.shot ? 'screenshot' : 'manual',
+        extended: { state15m: form.state15m, pattern: form.pattern, errors: form.errors, shot: form.shot || null },
       };
+    }
+
+    function fileToDataUrl(file) {
+      return new Promise((resolvePromise, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolvePromise(String(reader.result ?? ''));
+        reader.onerror = () => reject(new Error('读取截图失败'));
+        reader.readAsDataURL(file);
+      });
     }
 
     function nearestBar(bars, iso) {
@@ -336,7 +367,7 @@ window.__ModuleLoader__.load({
       bars.forEach((bar, index) => {
         const bx = x(index);
         const up = bar.close >= bar.open;
-        const color = up ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)';
+        const color = up ? 'var(--tc-up)' : 'var(--tc-down)';
         const openY = y(bar.open);
         const closeY = y(bar.close);
         const bodyY = Math.min(openY, closeY);
@@ -352,7 +383,7 @@ window.__ModuleLoader__.load({
         if (entryIndex < 0) return;
         const exitIndex = trade.closedAt ? nearestBar(bars, trade.closedAt) : -1;
         const long = trade.direction === 'long';
-        const color = long ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)';
+        const color = long ? 'var(--tc-up)' : 'var(--tc-down)';
         const entryX = x(entryIndex);
         const endX = exitIndex >= 0 ? x(exitIndex) : left + plotW;
         const entryY = y(trade.entryPrice);
@@ -674,12 +705,537 @@ window.__ModuleLoader__.load({
 
     // ---------------------------------------------------------------------
     // Panel
+
     // ---------------------------------------------------------------------
+    // 模块板
+    // ---------------------------------------------------------------------
+    const PAGE_SIZE = 10;
+    const PATTERN_OPTIONS = ['H1', 'H2', 'L1', 'L2', 'PIN', 'TR 反转', 'BREAKOUT', 'REVERSAL'];
+
+    const ERROR_CODES = [
+      ['E1', '入场太早'], ['E2', '入场太晚'], ['E3', '止损太紧'], ['E4', '止盈不合理'],
+      ['E5', '逆势加仓'], ['E6', '偏离计划'], ['E7', '追单 / 情绪单'], ['E8', '手数过大'],
+    ];
+    const ERR_LABEL = {
+      E1: '入场太早', E2: '入场太晚', E3: '止损太紧', E4: '止盈不合理',
+      E5: '逆势加仓', E6: '偏离计划', E7: '追单 / 情绪单', E8: '手数过大',
+    };
+    const CLOSE_SECONDS = 15 * 3600 + 6 * 60;
+
+    function two(value) {
+      return String(value).padStart(2, '0');
+    }
+
+    function signedMoney(value) {
+      const number = Number(value) || 0;
+      if (number === 0) return '¥0';
+      return `${number < 0 ? '−' : '+'}¥${Math.abs(number).toFixed(0)}`;
+    }
+
+    function plainMoney(value) {
+      const number = Number(value) || 0;
+      return `¥${Math.round(Math.abs(number)).toLocaleString('en-US')}`;
+    }
+
+    function secondsOfDay(date) {
+      return date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
+    }
+
+    function countdownText(session, live = true) {
+      if (!live) return { text: '复盘', sub: '历史交易日' };
+      if (session && session.open === false) return { text: '休市', sub: session.phase || '休市' };
+      const left = CLOSE_SECONDS - secondsOfDay(new Date());
+      if (left <= 0) return { text: '00:00', sub: '已收盘' };
+      const minutes = Math.floor(left / 60);
+      const seconds = left % 60;
+      const canOpen = session ? session.canOpen : true;
+      return {
+        text: `${two(minutes)}:${two(seconds)}`,
+        sub: canOpen ? `14:45 起禁开 · 剩 ${two(minutes)}:${two(seconds)}` : '已禁开新仓',
+      };
+    }
+
+    function openPrice(trades, symbol, price) {
+      if (!price) return 0;
+      let total = 0;
+      for (const trade of trades) {
+        if (trade.symbol !== symbol || trade.exitPrice !== null && trade.exitPrice !== undefined) continue;
+        const direction = trade.direction === 'short' ? -1 : 1;
+        total += (price - trade.entryPrice) * direction * (trade.lots ?? 0) * (trade.multiplier ?? 1);
+      }
+      return total;
+    }
+
+    function mixFrom(trades) {
+      const counts = new Map();
+      for (const trade of trades) {
+        const errors = Array.isArray(trade.extended?.errors) ? trade.extended.errors : [];
+        for (const code of errors) counts.set(code, (counts.get(code) ?? 0) + 1);
+      }
+      const total = Array.from(counts.values()).reduce((sum, value) => sum + value, 0);
+      return { rows: Array.from(counts.entries()).sort((a, b) => b[1] - a[1]), total };
+    }
+
+    function gateChecks(summary, session, live = true) {
+      const dailyCap = 1200;
+      const loss = summary?.dailyPnl ?? 0;
+      return [
+        { id: '01', name: '时段允许开新仓', value: live ? (session?.canOpen ? '可开仓' : (session?.reason ?? '禁开仓')) : '历史复盘', pass: live ? !!session?.canOpen : true },
+        { id: '02', name: '当日亏损未触及上限', value: `${plainMoney(loss)} / ${plainMoney(dailyCap)}`, pass: loss > -dailyCap },
+        { id: '03', name: '连续止损少于 3 笔', value: `${summary?.consecutiveLosses ?? 0} / 3`, pass: (summary?.consecutiveLosses ?? 0) < 3 },
+        { id: '04', name: '连续盈利少于 4 笔', value: `${summary?.consecutiveWins ?? 0} / 4`, pass: (summary?.consecutiveWins ?? 0) < 4 },
+        { id: '05', name: '无持仓、无挂单', value: `${summary?.openCount ?? 0} 笔持仓`, pass: (summary?.openCount ?? 0) === 0 },
+      ];
+    }
+
+    function Chip({ children, tone }) {
+      return h('span', { className: cls('tc-chip', tone && `is-${tone}`) }, children);
+    }
+
+    function KpiCard({ summary, session, trades, symbol, price, clock, day, live = true }) {
+      const down = countdownText(session, live);
+      const float = openPrice(trades, symbol, price);
+      const realized = summary?.dailyPnl ?? 0;
+      const left = (summary?.dailyLossRemaining ?? 0);
+      const tr = session?.tr;
+      return h('section', { className: 'tc-mod tc-kpi' },
+        h('div', { className: 'tc-stat-head' },
+          h('span', { className: 'tc-stamp' },
+            h('b', null, day || clock.day),
+            h('i', null, '·'),
+            h('span', null, live ? (session?.phase ?? '—') : '历史复盘'),
+            h('i', null, '·'),
+            h('span', { className: 'mono' }, clock.time)),
+          tr ? h('span', { className: 'tc-stamp-r' }, tr) : null),
+        h('div', { className: 'tc-kpis' },
+          h('div', { className: 'tc-kpi-cell' },
+            h('span', { className: 'tc-kpi-label' }, '距收盘'),
+            h('b', { className: 'tc-kpi-value mono' }, down.text),
+            h('span', { className: 'tc-kpi-sub' }, down.sub)),
+          h('div', { className: 'tc-kpi-cell' },
+            h('span', { className: 'tc-kpi-label' }, '当日已实现'),
+            h('b', { className: cls('tc-kpi-value', realized > 0 ? 'is-up' : realized < 0 ? 'is-down' : '') }, signedMoney(realized)),
+            h('span', { className: 'tc-kpi-sub' }, `${summary?.closedCount ?? 0} 笔 · 胜率 ${summary?.winRate ?? 0}%`)),
+          h('div', { className: 'tc-kpi-cell' },
+            h('span', { className: 'tc-kpi-label' }, '持仓浮动'),
+            h('b', { className: cls('tc-kpi-value', float > 0 ? 'is-up' : float < 0 ? 'is-down' : '') }, signedMoney(float)),
+            h('span', { className: 'tc-kpi-sub' }, `${summary?.openCount ?? 0} 笔持仓${price ? ` · 现价 ${fmtPrice(price)}` : ''}`)),
+          h('div', { className: 'tc-kpi-cell' },
+            h('span', { className: 'tc-kpi-label' }, '日亏剩余'),
+            h('b', { className: 'tc-kpi-value' }, plainMoney(left)),
+            h('span', { className: 'tc-kpi-sub' }, `上限 ¥1,200 · 已用 ${plainMoney(Math.max(0, -realized))}`))));
+    }
+
+    function MixPanel({ stats, trades, onManage }) {
+      const fallback = mixFrom(trades);
+      const rows = stats?.errors?.length
+        ? stats.errors
+        : fallback.rows.map(([code, count]) => ({ code, label: ERR_LABEL[code] ?? '', count, today: 0 }));
+      const total = rows.reduce((sum, row) => sum + (row.count ?? 0), 0);
+      return h('section', { className: 'tc-mod' },
+        h('div', { className: 'tc-mod-head' },
+          h('span', { className: 'tc-num' }, '01'),
+          h('h2', null, '失误清单'),
+          h('button', { className: 'tc-icon-btn tc-mod-action', title: '管理错误库', onClick: onManage }, '⚙'),
+          h('span', { className: 'tc-aside' }, total > 0 ? `累计 ${total} 次 · ${rows.length} 类` : '无记录')),
+        rows.length === 0
+          ? h('div', { className: 'tc-empty-line' }, '还没有记录失误——保持住')
+          : h('div', { className: 'tc-mix' }, rows.map((row) =>
+              h('div', { key: row.code, className: 'tc-mix-cell' },
+                h('span', { className: 'tc-mix-code' }, row.code),
+                h('span', { className: 'tc-mix-note' }, row.label || ERR_LABEL[row.code] || '已从字典删除'),
+                row.today > 0 ? h('span', { className: 'tc-mix-today' }, `今天 ${row.today}`) : null,
+                h('span', { className: 'tc-mix-count' }, `×${row.count}`)))));
+    }
+
+    function GatePanel({ summary, session, symbol, trades, live = true }) {
+      const checks = gateChecks(summary, session, live);
+      const blocked = checks.filter((check) => !check.pass);
+      const canOpen = blocked.length === 0;
+      const openTrade = trades.find((trade) => trade.symbol === symbol && (trade.exitPrice === null || trade.exitPrice === undefined));
+      return h('section', { className: 'tc-mod tc-gate' },
+        h('div', { className: 'tc-mod-head' },
+          h('span', { className: 'tc-num' }, '02'),
+          h('h2', null, '风险闸门'),
+          h('span', { className: 'tc-aside' }, `${checks.length} 项 · ${checks.length - blocked.length} 通过 · ${blocked.length} 拦截`)),
+        h('div', { className: 'tc-gate-verdict' },
+          h('span', { className: 'tc-gate-verdict-label' }, '当前结论'),
+          h('b', { className: cls('tc-gate-word', canOpen ? 'is-ok' : 'is-no') }, canOpen ? '可做' : '不做'),
+          h('p', { className: 'tc-gate-why' },
+            blocked.length === 0
+              ? '五项闸门全部通过，按手册找 H2 / L2 再进。'
+              : `${blocked[0].name}：${blocked[0].value}。${openTrade ? '等平仓或止损后再找信号。' : '先处理这一项再找信号。'}`),
+          openTrade
+            ? h('span', { className: 'tc-gate-meta' }, `${openTrade.direction === 'long' ? '多' : '空'} ${openTrade.lots} 手 @ ${fmtPrice(openTrade.entryPrice)}`)
+            : null),
+        h('div', { className: 'tc-gate-checks' }, checks.map((check) =>
+          h('div', { key: check.id, className: cls('tc-gate-check', !check.pass && 'is-bad') },
+            h('span', { className: 'tc-gate-id' }, check.id),
+            h('span', { className: 'tc-gate-name' }, check.name),
+            h('span', { className: 'tc-gate-value' }, check.value),
+            h('span', { className: 'tc-gate-state' }, check.pass ? '通过' : '拦截')))));
+    }
+
+    function ChartPanel({ kline, trades, symbol, symbols, onSymbol, klineType, onChangeType, loading, error }) {
+      const price = kline?.bars?.length ? kline.bars[kline.bars.length - 1].close : null;
+      return h('section', { className: 'tc-mod' },
+        h('div', { className: 'tc-mod-head' },
+          h('span', { className: 'tc-num' }, '03'),
+          h('h2', null, '盘中走势'),
+          h('select', { className: 'tc-mini-select', value: symbol, onChange: (event) => onSymbol(event.target.value) },
+            (symbols ?? SYMBOLS).map((item) => h('option', { key: item, value: item }, item))),
+          h('span', { className: 'tc-aside mono' }, kline
+            ? `ATR14 ${kline.atr14 ?? '—'} · EMA20 ${kline.ema20Last ?? '—'}`
+            : '')),
+        h('div', { className: 'tc-chart-bar' },
+          h('div', { className: 'tc-seg' },
+            h('button', { className: cls('tc-seg-btn', klineType === 3 && 'is-on'), onClick: () => onChangeType(3) }, '3m'),
+            h('button', { className: cls('tc-seg-btn', klineType === 15 && 'is-on'), onClick: () => onChangeType(15) }, '15m')),
+          h('div', { className: 'tc-legend' },
+            h('span', null, h('i', { className: 'tc-sw is-up' }), '上涨'),
+            h('span', null, h('i', { className: 'tc-sw is-down' }), '下跌'),
+            h('span', null, h('i', { className: 'tc-sw is-ema' }), 'EMA20'),
+            h('span', null, h('i', { className: 'tc-sw is-stop' }), '止损'),
+            h('span', null, h('i', { className: 'tc-sw is-target' }), '目标')),
+          h('span', { className: 'tc-aside mono' }, kline ? `${kline.bars?.length ?? 0} 根 · 更新 ${fmtTime(kline.fetchedAt)}` : '')),
+        error ? h('div', { className: 'tc-inline-error' }, error) : null,
+        loading && !kline ? h('div', { className: 'tc-empty-line' }, '正在拉取 K 线…') : null,
+        kline ? h('div', { className: 'tc-chart-body' },
+          h(KlineChart, { bars: kline.bars, trades: trades.filter((trade) => trade.symbol === symbol) })) : null,
+        kline?.warning ? h('div', { className: 'tc-inline-warn' }, kline.warning) : null);
+    }
+
+    function TradesPanel2({ trades, symbol, onDelete, confirmId, onAdd }) {
+      const [filter, setFilter] = useState({ pat: '', sym: '', q: '', page: 1, day: '' });
+      const setField = (name, value) => setFilter((previous) => ({ ...previous, [name]: value, page: 1 }));
+      const rows = useMemo(() => {
+        const query = filter.q.trim().toLowerCase();
+        return trades.filter((trade) => {
+          const pat = trade.extended?.pattern ?? trade.extended?.state15m ?? '';
+          if (filter.pat && pat !== filter.pat) return false;
+          if (filter.sym && trade.symbol !== filter.sym) return false;
+          if (!query) return true;
+          const hay = [trade.tradingDay, fmtTime(trade.openedAt), pat, trade.symbol, trade.note, trade.direction === 'long' ? '多' : '空']
+            .filter(Boolean).join(' ').toLowerCase();
+          return hay.includes(query);
+        });
+      }, [trades, filter]);
+      const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+      const page = Math.min(filter.page, pages);
+      const view = rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+      const closed = rows.filter((trade) => trade.exitPrice !== null && trade.exitPrice !== undefined);
+      const net = closed.reduce((sum, trade) => sum + (trade.pnl ?? 0), 0);
+      const rate = closed.length === 0 ? 0 : Math.round((closed.filter((trade) => (trade.pnl ?? 0) > 0).length / closed.length) * 100);
+      const patSet = Array.from(new Set(trades.map((trade) => trade.extended?.pattern ?? trade.extended?.state15m).filter(Boolean)));
+      const symSet = Array.from(new Set(trades.map((trade) => trade.symbol).filter(Boolean)));
+      return h('section', { className: 'tc-mod' },
+        h('div', { className: 'tc-mod-head' },
+          h('span', { className: 'tc-num' }, '04'),
+          h('h2', null, '交易记录'),
+          h('button', { className: 'tc-btn tc-btn-sm tc-mod-action', onClick: onAdd }, '＋ 添加交易'),
+          h('span', { className: 'tc-aside' }, `共 ${rows.length} 笔 · 第 ${page}/${pages} 页`)),
+        h('div', { className: 'tc-filters' },
+          h('select', { className: 'tc-mini-select', value: filter.pat, onChange: (event) => setField('pat', event.target.value) },
+            h('option', { value: '' }, '全部形态'),
+            patSet.map((item) => h('option', { key: item, value: item }, item))),
+          h('select', { className: 'tc-mini-select', value: filter.sym, onChange: (event) => setField('sym', event.target.value) },
+            h('option', { value: '' }, '全部品种'),
+            symSet.map((item) => h('option', { key: item, value: item }, item))),
+          h('input', {
+            className: 'tc-mini-input', placeholder: '搜索形态 / 备注 / 时间',
+            value: filter.q, onChange: (event) => setField('q', event.target.value),
+          }),
+          h('button', { className: 'tc-btn tc-btn-sm', onClick: () => setFilter({ pat: '', sym: '', q: '', page: 1, day: '' }) }, '重置')),
+        h('div', { className: 'tc-table tc-t-list' },
+          h('div', { className: 'tc-tr is-head' },
+            h('span', null, '日期'), h('span', null, '时间'), h('span', null, '方向'),
+            h('span', null, '形态'), h('span', null, '品种'), h('span', null, '入场'),
+            h('span', null, '手数'), h('span', null, '状态'), h('span', null, '错'), h('span', null, '盈亏'),
+            h('span', { className: 'tc-note-col' }, '备注'), h('span', null, '')),
+          view.length === 0
+            ? h('div', { className: 'tc-empty-line' }, '没有符合条件的记录')
+            : view.map((trade) =>
+                h('div', { key: trade.id, className: 'tc-tr' },
+                  h('span', { className: 'mono' }, (trade.tradingDay ?? '').slice(5)),
+                  h('span', { className: 'mono' }, fmtTime(trade.openedAt)),
+                  h('span', { className: cls('tc-dir', trade.direction === 'long' ? 'is-long' : 'is-short') }, trade.direction === 'long' ? '多' : '空'),
+                  h('span', { className: 'mono' }, trade.extended?.pattern ?? trade.extended?.state15m ?? '—'),
+                  h('span', null, trade.symbol),
+                  h('span', { className: 'mono' }, fmtPrice(trade.entryPrice)),
+                  h('span', { className: 'mono' }, trade.lots),
+                  h('span', null, trade.exitPrice === null || trade.exitPrice === undefined
+                    ? h('em', { className: 'tc-tag is-live' }, '持仓')
+                    : h('em', { className: 'tc-tag' }, '已平')),
+                  h('span', { className: 'tc-errs mono' }, (trade.extended?.errors ?? []).join(' ') || '—'),
+                  h('span', { className: cls('mono', (trade.pnl ?? 0) > 0 ? 'is-up' : (trade.pnl ?? 0) < 0 ? 'is-down' : '') },
+                    trade.pnl === null || trade.pnl === undefined ? '—' : signedMoney(trade.pnl)),
+                  h('span', { className: 'tc-note-col tc-note' }, trade.note || ''),
+                  h('span', null, h('button', { className: 'tc-icon-btn', title: '删除', onClick: () => onDelete(trade.id) }, confirmId === trade.id ? '确认' : '✕')))),
+          ),
+        h('div', { className: 'tc-mod-foot' },
+          h('span', null, `净 ${signedMoney(net)} · ${closed.length} 笔已平 · 胜率 ${rate}%`),
+          h('div', { className: 'tc-pager' },
+            h('button', { className: 'tc-page-btn', disabled: page <= 1, onClick: () => setFilter((previous) => ({ ...previous, page: page - 1 })) }, '‹'),
+            h('span', { className: 'mono' }, `${page} / ${pages}`),
+            h('button', { className: 'tc-page-btn', disabled: page >= pages, onClick: () => setFilter((previous) => ({ ...previous, page: page + 1 })) }, '›'))));
+    }
+
+    function AddTradeDialog({
+      open, onClose, form, setForm, onSubmit, saving, formError, drafts,
+      onConfirmDraft, onDiscardDraft, symbol, symbols, dict, onManageDict, onUploadShot, uploading,
+    }) {
+      const boxRef = useRef(null);
+      const fileRef = useRef(null);
+      const closeRef = useRef(onClose);
+      closeRef.current = onClose;
+
+      useEffect(() => {
+        if (!open) return undefined;
+        const previous = document.activeElement;
+        const box = boxRef.current;
+        const focusables = () => Array.from(box?.querySelectorAll('input:not([type="hidden"]),select,textarea,button:not(:disabled),[tabindex]:not([tabindex="-1"])') ?? [])
+          .filter((node) => node.offsetParent !== null || node === document.activeElement);
+        const first = box?.querySelector('form input:not([type="hidden"]), form select, form textarea') ?? focusables()[0];
+        if (first) first.focus();
+        const onKey = (event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            closeRef.current();
+            return;
+          }
+          if (event.key !== 'Tab') return;
+          const nodes = focusables();
+          if (nodes.length === 0) return;
+          const head = nodes[0];
+          const tail = nodes[nodes.length - 1];
+          if (event.shiftKey && document.activeElement === head) {
+            event.preventDefault();
+            tail.focus();
+          } else if (!event.shiftKey && document.activeElement === tail) {
+            event.preventDefault();
+            head.focus();
+          }
+        };
+        const onPaste = (event) => {
+          const item = Array.from(event.clipboardData?.items ?? []).find((entry) => entry.type.startsWith('image/'));
+          const file = item?.getAsFile?.();
+          if (!file) return;
+          event.preventDefault();
+          onUploadShot(file);
+        };
+        document.addEventListener('keydown', onKey, true);
+        document.addEventListener('paste', onPaste, true);
+        return () => {
+          document.removeEventListener('keydown', onKey, true);
+          document.removeEventListener('paste', onPaste, true);
+          if (previous && typeof previous.focus === 'function') previous.focus();
+        };
+      }, [open]);
+
+      if (!open) return null;
+      const setField = (name, value) => setForm((previous) => ({ ...previous, [name]: value }));
+      const field = (name, label, type, options) =>
+        h('label', { className: 'tc-field' },
+          h('span', { className: 'tc-field-label' }, label),
+          type === 'select'
+            ? h('select', { className: 'tc-input', value: form[name], onChange: (event) => setField(name, event.target.value) },
+                options.map(([value, text]) => h('option', { key: value, value }, text)))
+            : h('input', {
+                className: 'tc-input', type, step: type === 'number' ? '0.001' : undefined,
+                value: form[name], onChange: (event) => setField(name, event.target.value),
+              }));
+      const patternOptions = dict?.patterns?.length
+        ? [['', '未选'], ...dict.patterns.map((item) => [item.code, item.label ? `${item.code} · ${item.label}` : item.code])]
+        : [['', '未选'], ...PATTERN_OPTIONS.map((item) => [item, item])];
+      const errorOptions = dict?.errors?.length ? dict.errors : ERROR_CODES.map(([code, text]) => ({ code, label: text }));
+      const allSymbols = Array.from(new Set([...SYMBOLS, ...(symbols ?? []), form.symbol || symbol].filter(Boolean)));
+
+      function pickFile(file) {
+        if (!file) return;
+        if (!file.type.startsWith('image/')) return;
+        onUploadShot(file);
+      }
+
+      return h('div', { className: 'tc-dlg', onClick: (event) => { if (event.target === event.currentTarget) onClose(); } },
+        h('div', { className: 'tc-dlg-box', ref: boxRef, role: 'dialog', 'aria-modal': 'true', 'aria-label': '添加交易' },
+          h('div', { className: 'tc-dlg-head' },
+            h('h3', null, '添加交易'),
+            h('span', { className: 'tc-aside mono' }, `${form.symbol || symbol}`),
+            h('button', { className: 'tc-icon-btn', onClick: onClose, title: '关闭' }, '✕')),
+          h('form', { className: 'tc-form', onSubmit },
+            h('div', { className: 'tc-form-grid' },
+              h('label', { className: 'tc-field' },
+                h('span', { className: 'tc-field-label' }, '合约'),
+                h('select', {
+                  className: 'tc-input', value: form.symbol || symbol,
+                  onChange: (event) => {
+                    const value = event.target.value;
+                    setForm((previous) => ({ ...previous, symbol: value, multiplier: String(multiplierOf(value)) }));
+                  },
+                }, allSymbols.map((item) => h('option', { key: item, value: item }, item)))),
+              field('direction', '方向', 'select', [['long', '做多'], ['short', '做空']]),
+              field('entryTime', '入场时间', 'datetime-local'),
+              field('entryPrice', '入场价', 'number'),
+              field('stopPrice', '止损价', 'number'),
+              field('targetPrice', '目标价', 'number'),
+              field('lots', '手数', 'number'),
+              field('exitTime', '离场时间', 'datetime-local'),
+              field('exitPrice', '离场价', 'number'),
+              h('label', { className: 'tc-field' },
+                h('span', { className: 'tc-field-label' }, '15m 状态'),
+                h('select', { className: 'tc-input', value: form.state15m, onChange: (event) => setField('state15m', event.target.value) },
+                  MODE_OPTIONS.map(([value, text]) => h('option', { key: value, value }, text)))),
+              h('label', { className: 'tc-field' },
+                h('span', { className: 'tc-field-label' }, '形态 / 状态', h('button', {
+                  type: 'button', className: 'tc-link', onClick: () => onManageDict('pattern'),
+                }, '管理')),
+                h('select', { className: 'tc-input', value: form.pattern, onChange: (event) => setField('pattern', event.target.value) },
+                  patternOptions.map(([value, text]) => h('option', { key: value, value }, text))))),
+            h('div', { className: 'tc-field tc-field-wide' },
+              h('span', { className: 'tc-field-label' }, '犯错 · 可多选'),
+              h('div', { className: 'tc-errs-row' },
+                h('select', {
+                  className: 'tc-input', value: '',
+                  onChange: (event) => {
+                    const code = event.target.value;
+                    if (!code) return;
+                    setForm((previous) => ({
+                      ...previous,
+                      errors: previous.errors.includes(code) ? previous.errors : [...previous.errors, code],
+                    }));
+                    event.target.value = '';
+                  },
+                },
+                  h('option', { value: '' }, '＋ 选择错误'),
+                  errorOptions.map((item) => h('option', { key: item.code, value: item.code }, `${item.code} · ${item.label ?? ''}`))),
+                (form.errors ?? []).length > 0
+                  ? h('div', { className: 'tc-chip-row' }, (form.errors ?? []).map((code) => {
+                      const pair = errorOptions.find((item) => item.code === code);
+                      return h('span', { key: code, className: 'tc-chip' },
+                        `${code} ${pair ? pair.label : ''}`,
+                        h('button', {
+                          type: 'button', className: 'tc-chip-x', title: '移除',
+                          onClick: () => setForm((previous) => ({ ...previous, errors: previous.errors.filter((item) => item !== code) })),
+                        }, '×'));
+                    }))
+                  : null)),
+            h('div', { className: 'tc-field tc-field-wide' },
+              h('span', { className: 'tc-field-label' }, '交易截图'),
+              h('input', {
+                ref: fileRef, type: 'file', accept: 'image/png,image/jpeg,image/webp', style: { display: 'none' },
+                onChange: (event) => { pickFile(event.target.files?.[0]); event.target.value = ''; },
+              }),
+              form.shotPreview
+                ? h('div', { className: 'tc-shot-row' },
+                    h('img', { className: 'tc-shot-thumb', src: form.shotPreview, alt: '交易截图' }),
+                    h('span', { className: 'tc-muted' }, '截图已保存，可随交易归档'),
+                    h('button', {
+                      type: 'button', className: 'tc-btn tc-btn-sm',
+                      onClick: () => setForm((previous) => ({ ...previous, shot: '', shotPreview: '' })),
+                    }, '移除'))
+                : h('button', {
+                    type: 'button', className: cls('tc-shot-drop', uploading && 'is-busy'),
+                    onClick: () => fileRef.current?.click(),
+                    onDragOver: (event) => event.preventDefault(),
+                    onDrop: (event) => { event.preventDefault(); pickFile(event.dataTransfer?.files?.[0]); },
+                  }, uploading ? '截图上传中…' : '点击选图，或在本页 Ctrl/⌘+V 粘贴截图')),
+            h('label', { className: 'tc-field tc-field-wide' },
+              h('span', { className: 'tc-field-label' }, '备注'),
+              h('textarea', { className: 'tc-input', rows: 2, value: form.note, onChange: (event) => setField('note', event.target.value) })),
+            formError ? h('div', { className: 'tc-inline-error' }, formError) : null,
+            h('div', { className: 'tc-form-actions' },
+              h('button', { className: 'tc-btn tc-btn-primary', type: 'submit', disabled: saving }, saving ? '保存中…' : '保存'),
+              h('button', { className: 'tc-btn', type: 'button', onClick: () => setForm(emptyForm(form.symbol || symbol)) }, '清空'))),
+          drafts.length > 0
+            ? h('div', { className: 'tc-draft-block' },
+                h('div', { className: 'tc-sub-head' }, h('h3', null, '截图草稿'), h('span', { className: 'tc-aside' }, `${drafts.length} 条待确认`)),
+                drafts.map((draft) => h(DraftCard, { key: draft.id, draft, onConfirm: onConfirmDraft, onDiscard: onDiscardDraft })))
+            : null));
+    }
+
+    function DictDialog({ open, kind, onClose, dict, stats, onChanged }) {
+      const [code, setCode] = useState('');
+      const [label, setLabel] = useState('');
+      const [error, setError] = useState('');
+      const [busy, setBusy] = useState(false);
+
+      useEffect(() => {
+        if (!open) return;
+        setCode('');
+        setLabel('');
+        setError('');
+      }, [open, kind]);
+
+      if (!open) return null;
+      const isPattern = kind === 'pattern';
+      const bucket = isPattern ? dict?.patterns ?? [] : dict?.errors ?? [];
+      const usage = (isPattern ? dict?.usage?.patterns : dict?.usage?.errors) ?? {};
+      const historical = (isPattern ? stats?.patterns : stats?.errors) ?? [];
+
+      async function add() {
+        if (!code.trim()) {
+          setError('代码不能为空');
+          return;
+        }
+        setBusy(true);
+        setError('');
+        try {
+          const data = await api('dict', { method: 'POST', body: JSON.stringify({ kind: isPattern ? 'pattern' : 'error', code: code.trim(), label: label.trim() }) });
+          await onChanged(data);
+          setCode('');
+          setLabel('');
+        } catch (saveError) {
+          setError(saveError.message);
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function remove(codeValue) {
+        setBusy(true);
+        setError('');
+        try {
+          const data = await api(`dict?kind=${isPattern ? 'pattern' : 'error'}&code=${encodeURIComponent(codeValue)}`, { method: 'DELETE' });
+          await onChanged(data);
+        } catch (saveError) {
+          setError(saveError.message);
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      return h('div', { className: 'tc-dlg', onClick: (event) => { if (event.target === event.currentTarget) onClose(); } },
+        h('div', { className: 'tc-dlg-box tc-dict-box', role: 'dialog', 'aria-modal': 'true', 'aria-label': isPattern ? '形态库' : '错误库' },
+          h('div', { className: 'tc-dlg-head' },
+            h('h3', null, isPattern ? '形态库' : '错误库'),
+            h('span', { className: 'tc-aside' }, `${bucket.length} 项`),
+            h('button', { className: 'tc-icon-btn', onClick: onClose, title: '关闭' }, '✕')),
+          h('div', { className: 'tc-dict-list' },
+            bucket.length === 0
+              ? h('div', { className: 'tc-empty-line' }, '还没有条目')
+              : bucket.map((item) => h('div', { key: item.code, className: 'tc-dict-row' },
+                  h('span', { className: 'tc-dict-code mono' }, item.code),
+                  h('span', { className: 'tc-dict-label' }, item.label || ''),
+                  h('span', { className: 'tc-dict-count mono' }, `×${usage[item.code] ?? 0}`),
+                  h('button', { className: 'tc-icon-btn', title: '删除', disabled: busy, onClick: () => remove(item.code) }, '✕'))),
+            historical.filter((row) => !bucket.some((item) => item.code === row.code)).length > 0
+              ? h('div', { className: 'tc-dict-extra' },
+                  h('div', { className: 'tc-muted' }, '历史交易里还用到、但已从字典删除的代码：'),
+                  historical.filter((row) => !bucket.some((item) => item.code === row.code)).map((row) =>
+                    h('span', { key: row.code, className: 'tc-chip' }, `${row.code}${row.label ? ` ${row.label}` : ''} ×${row.count}`)))
+              : null),
+          h('div', { className: 'tc-dict-add' },
+            h('input', { className: 'tc-input', placeholder: isPattern ? '如 H3 / WEDGE' : '如 E9', value: code, onChange: (event) => setCode(event.target.value), maxLength: 24 }),
+            h('input', { className: 'tc-input', placeholder: '说明，如 提前离场', value: label, onChange: (event) => setLabel(event.target.value) }),
+            h('button', { className: 'tc-btn tc-btn-primary', disabled: busy, onClick: add }, busy ? '处理中…' : '添加')),
+          error ? h('div', { className: 'tc-inline-error' }, error) : null,
+          h('div', { className: 'tc-muted tc-dict-hint' }, '删掉一项只从候选里移除，不会改写历史交易里的代码。')));
+    }
+
     function TradingCockpit() {
       const [state, setState] = useState(null);
       const [day, setDay] = useState('');
       const [symbol, setSymbol] = useState('PP0');
-      const [tab, setTab] = useState('kline');
       const [kline, setKline] = useState(null);
       const [klineType, setKlineType] = useState(3);
       const [klineLoading, setKlineLoading] = useState(false);
@@ -692,9 +1248,34 @@ window.__ModuleLoader__.load({
       const [formError, setFormError] = useState('');
       const [saving, setSaving] = useState(false);
       const [confirmId, setConfirmId] = useState('');
+      const [addOpen, setAddOpen] = useState(false);
+      const [dict, setDict] = useState({ patterns: [], errors: [], usage: { patterns: {}, errors: {} } });
+      const [stats, setStats] = useState(null);
+      const [dictOpen, setDictOpen] = useState(null);
+      const [palette, setPalette] = useState(readPalette);
+      const [uploading, setUploading] = useState(false);
+      const [clock, setClock] = useState(() => currentClock());
       const [decision, setDecision] = useState({
         state15m: 'trend', bias: 'none', aligned3m: false, pullback: false, atEdge: false, signal: false, stopPoints: '', targetR: '', lots: '',
       });
+
+      function currentClock() {
+        const now = new Date();
+        const parts = shanghaiParts(now);
+        return {
+          day: `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`,
+          time: `${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}:${String(new Date().getSeconds()).padStart(2, '0')}`,
+        };
+      }
+
+      useEffect(() => {
+        const timer = setInterval(() => setClock(currentClock()), 1000);
+        return () => clearInterval(timer);
+      }, []);
+
+      useEffect(() => {
+        savePalette(palette);
+      }, [palette]);
 
       useEffect(() => {
         if (!toast) return undefined;
@@ -711,8 +1292,7 @@ window.__ModuleLoader__.load({
         setKlineError('');
         try {
           const query = new URLSearchParams({ symbol: targetSymbol, type: String(type), day: targetDay, force: force ? '1' : '0' });
-          const data = await api(`kline?${query}`);
-          setKline(data);
+          setKline(await api(`kline?${query}`));
         } catch (fetchError) {
           setKlineError(fetchError.message);
         } finally {
@@ -731,6 +1311,9 @@ window.__ModuleLoader__.load({
           setState(data);
           setDay(data.day);
           setSymbol(data.symbol);
+          const [dictData, statsData] = await Promise.all([api('dict'), api('stats')]);
+          setDict(dictData);
+          setStats(statsData);
           await loadKline(data.day, data.symbol, klineType, force === true);
           if ((rules.outline ?? []).length === 0) {
             const outline = await api('rules');
@@ -744,11 +1327,13 @@ window.__ModuleLoader__.load({
       }
 
       async function refreshAll() {
-        if (!day) {
-          await loadAll('', symbol, true);
-          return;
-        }
-        await loadAll(day, symbol, true);
+        await loadAll(day || '', symbol, true);
+      }
+
+      async function changeSymbol(value) {
+        setSymbol(value);
+        setForm((previous) => ({ ...previous, symbol: value, multiplier: String(multiplierOf(value)) }));
+        await loadAll(day, value, false);
       }
 
       async function changeKlineType(type) {
@@ -758,15 +1343,11 @@ window.__ModuleLoader__.load({
 
       async function submitSearch(event) {
         event.preventDefault();
-        const query = rules.query.trim();
-        if (query === '') {
-          setRules((previous) => ({ ...previous, results: null, section: null }));
-          return;
-        }
         setRules((previous) => ({ ...previous, loading: true, section: null }));
         try {
-          const data = await api(`rules?q=${encodeURIComponent(query)}&limit=50`);
-          setRules((previous) => ({ ...previous, loading: false, results: data.results ?? [] }));
+          const query = new URLSearchParams({ q: rules.query ?? '' });
+          const data = await api(`rules?${query}`);
+          setRules((previous) => ({ ...previous, results: data.results ?? [], sectionCount: data.sectionCount, loading: false }));
         } catch (fetchError) {
           setRules((previous) => ({ ...previous, loading: false }));
           setToast({ kind: 'error', text: fetchError.message });
@@ -775,9 +1356,11 @@ window.__ModuleLoader__.load({
 
       async function openSection(id) {
         try {
+          setRules((previous) => ({ ...previous, loading: true }));
           const section = await api(`rule?id=${encodeURIComponent(id)}`);
-          setRules((previous) => ({ ...previous, section }));
+          setRules((previous) => ({ ...previous, section, loading: false }));
         } catch (fetchError) {
+          setRules((previous) => ({ ...previous, loading: false }));
           setToast({ kind: 'error', text: fetchError.message });
         }
       }
@@ -787,16 +1370,17 @@ window.__ModuleLoader__.load({
         setFormError('');
         setSaving(true);
         try {
-          const payload = buildPayload(form, symbol, day);
+          const targetSymbol = (form.symbol || symbol || 'PP0').toUpperCase();
+          const payload = buildPayload(form, targetSymbol, day);
           const data = await api('trades', { method: 'POST', body: JSON.stringify({ trade: payload }) });
-          const warningText = data.warnings?.length ? `\n告警：${data.warnings.join('；')}` : '';
-          setToast({ kind: 'ok', text: `已保存 ${data.trade.id}。${warningText}` });
-          setForm(emptyForm(symbol));
-          await loadAll(data.day || day, symbol, false);
+          setToast({ kind: 'ok', text: `已保存 ${data.trade.id}${data.warnings?.length ? `　告警：${data.warnings.join('；')}` : ''}` });
+          setForm(emptyForm(targetSymbol));
+          setAddOpen(false);
+          setSymbol(targetSymbol);
+          await loadAll(data.day || day, targetSymbol, false);
         } catch (saveError) {
           const details = saveError.details;
-          const message = details?.errors?.length ? `${saveError.message}\n${details.errors.join('；')}` : saveError.message;
-          setFormError(message);
+          setFormError(details?.errors?.length ? `${saveError.message}\n${details.errors.join('；')}` : saveError.message);
           setToast({ kind: 'error', text: saveError.message });
         } finally {
           setSaving(false);
@@ -806,7 +1390,7 @@ window.__ModuleLoader__.load({
       async function confirmDraft(draft, trade) {
         try {
           const data = await api('trades', { method: 'POST', body: JSON.stringify({ trade, draftId: draft.id }) });
-          setToast({ kind: 'ok', text: `草稿已入账：${data.trade.id}${data.warnings?.length ? `\n告警：${data.warnings.join('；')}` : ''}` });
+          setToast({ kind: 'ok', text: `草稿已入账：${data.trade.id}` });
           await loadAll(data.day || day, symbol, false);
           return true;
         } catch (saveError) {
@@ -824,10 +1408,36 @@ window.__ModuleLoader__.load({
         }
       }
 
+      async function uploadShot(file) {
+        if (!file) return;
+        setUploading(true);
+        try {
+          const dataUrl = await fileToDataUrl(file);
+          if (!dataUrl.startsWith('data:image/')) throw new Error('只支持图片文件');
+          if (dataUrl.length > 11 * 1024 * 1024) throw new Error('截图太大，请压缩到 8MB 以内');
+          const data = await api('shots', { method: 'POST', body: JSON.stringify({ name: file.name || 'screenshot', dataUrl }) });
+          setForm((previous) => ({ ...previous, shot: data.shot.id, shotPreview: dataUrl }));
+          setToast({ kind: 'ok', text: '截图已保存，会随交易归档。' });
+        } catch (uploadError) {
+          setToast({ kind: 'error', text: uploadError.message });
+        } finally {
+          setUploading(false);
+        }
+      }
+
+      async function refreshDict(data) {
+        if (data) setDict(data);
+        try {
+          setStats(await api('stats'));
+        } catch {
+          /* keep the previous stats */
+        }
+      }
+
       async function deleteTrade(id) {
         if (confirmId !== id) {
           setConfirmId(id);
-          setToast({ kind: 'ok', text: '再点一次「确认删除」才会删除。' });
+          setToast({ kind: 'ok', text: '再点一次「确认」才会删除。' });
           return;
         }
         setConfirmId('');
@@ -841,99 +1451,68 @@ window.__ModuleLoader__.load({
 
       const summary = state?.summary;
       const session = state?.session;
-      const guards = summary?.guards ?? [];
-      const symbolOptions = Array.from(new Set([
-        ...SYMBOLS,
-        ...(state?.trades ?? []).map((trade) => trade.symbol).filter(Boolean),
-        symbol,
-      ]));
-      const tabs = [
-        ['kline', 'K线'],
-        ['rules', '规则'],
-        ['trades', '交易'],
-        ['decision', '决策'],
-      ];
+      const trades = state?.trades ?? [];
+      const drafts = state?.drafts ?? [];
+      const price = kline?.bars?.length ? kline.bars[kline.bars.length - 1].close : null;
+      const live = !session?.tradingDay || day === session.tradingDay;
+      const symbolOptions = Array.from(new Set([...SYMBOLS, ...trades.map((trade) => trade.symbol).filter(Boolean), symbol, form.symbol].filter(Boolean)));
 
-      return h('div', { className: 'tc-root' },
-        h('header', { className: 'tc-header' },
+      return h('div', { className: 'tc-root', 'data-palette': palette },
+        h('header', { className: 'tc-top' },
           h('div', { className: 'tc-brand' },
-            h('span', { className: 'tc-logo' }, '◎'),
-            h('div', null,
-              h('div', { className: 'tc-title' }, '交易中控台'),
-              h('div', { className: 'tc-subtitle' }, '执行手册 · 当日交易 · K 线标记'))),
-          h('div', { className: 'tc-controls' },
-            h('label', { className: 'tc-inline-field' }, '交易日',
-              h('input', {
-                className: 'tc-input', type: 'date', value: day || '',
-                onChange: (event) => {
-                  const value = event.target.value;
-                  setDay(value);
-                  if (value) void loadAll(value, symbol, false);
-                },
-              })),
-            h('label', { className: 'tc-inline-field' }, '品种',
-              h('select', {
-                className: 'tc-select', value: symbol,
-                onChange: (event) => {
-                  const value = event.target.value;
-                  setSymbol(value);
-                  setForm((previous) => ({ ...previous, multiplier: String(multiplierOf(value)) }));
-                  void loadAll(day, value, false);
-                },
-              }, symbolOptions.map((item) => h('option', { key: item, value: item }, item)))),
-            h('button', { className: 'tc-btn', onClick: refreshAll, disabled: loading }, loading ? '刷新中…' : '刷新'),
-            h('button', { className: 'tc-btn', onClick: () => { setDay(''); void loadAll('', symbol, true); } }, '当前交易日')),
-          h('div', { className: 'tc-stats' },
-            h(Stat, { label: '时段', value: session?.phase ?? '—', tone: session?.canOpen ? 'ok' : 'warn', hint: session?.reason }),
-            h(Stat, { label: '日盈亏', value: `¥${fmtMoney(summary?.dailyPnl)}`, tone: (summary?.dailyPnl ?? 0) < 0 ? 'error' : (summary?.dailyPnl ?? 0) > 0 ? 'ok' : undefined }),
-            h(Stat, { label: '已平 / 持仓', value: `${summary?.closedCount ?? 0} / ${summary?.openCount ?? 0}` }),
-            h(Stat, { label: '连亏 / 连赢', value: `${summary?.consecutiveLosses ?? 0} / ${summary?.consecutiveWins ?? 0}`, tone: (summary?.consecutiveLosses ?? 0) >= 3 ? 'error' : undefined }),
-            h(Stat, { label: '日亏剩余', value: `¥${fmtMoney(summary?.dailyLossRemaining)}` }),
-            h(Stat, { label: '风险额度', value: `¥${fmtMoney(summary?.openRisk)}` }))),
-        guards.length > 0 ? h('div', { className: 'tc-guards' }, guards.map((guard) => h('span', { key: guard, className: 'tc-guard' }, guard))) : null,
-        h('nav', { className: 'tc-tabs' }, tabs.map(([key, label]) => h('button', {
-          key, className: cls('tc-tab', tab === key && 'is-active'), onClick: () => setTab(key),
-        }, label))),
-        h('main', { className: 'tc-body' },
-          error ? h('div', { className: 'tc-error' }, error, h('button', { className: 'tc-btn', onClick: refreshAll }, '重试')) : null,
-          loading && !state ? h(Empty, null, '正在加载…') : null,
-          !loading && !state && !error ? h(Empty, null, '没有数据。') : null,
-          state && tab === 'kline'
-            ? h('section', { className: 'tc-kline' },
-                h('div', { className: 'tc-kline-toolbar' },
-                  h('div', { className: 'tc-segmented' },
-                    h('button', { className: cls('tc-seg', klineType === 3 && 'is-active'), onClick: () => changeKlineType(3) }, '3 分钟'),
-                    h('button', { className: cls('tc-seg', klineType === 15 && 'is-active'), onClick: () => changeKlineType(15) }, '15 分钟')),
-                  h('div', { className: 'tc-legend' },
-                    h('span', { className: 'tc-legend-item' }, h('i', { className: 'tc-dot tc-dot-entry' }), '开仓'),
-                    h('span', { className: 'tc-legend-item' }, h('i', { className: 'tc-dot tc-dot-exit' }), '平仓'),
-                    h('span', { className: 'tc-legend-item' }, h('i', { className: 'tc-dot tc-dot-stop' }), '止损'),
-                    h('span', { className: 'tc-legend-item' }, h('i', { className: 'tc-dot tc-dot-target' }), '目标'),
-                    h('span', { className: 'tc-legend-item' }, h('i', { className: 'tc-dot tc-dot-ema' }), 'EMA20')),
-                  h('div', { className: 'tc-muted' }, kline ? `${kline.symbol} · ${kline.type}m · ${kline.bars?.length ?? 0} 根 · 数据 ${fmtTime(kline.fetchedAt)}${kline.cached ? ' · 缓存' : ''}` : '')),
-                klineError ? h('div', { className: 'tc-error' }, klineError) : null,
-                klineLoading && !kline ? h(Empty, null, '正在拉取 K 线…') : null,
-                kline ? h(KlineChart, { bars: kline.bars, trades: (state.trades ?? []).filter((trade) => trade.symbol === symbol) }) : null,
-                kline ? h('div', { className: 'tc-kline-meta' },
-                  h('span', null, `窗口 ${kline.window?.start?.slice(5, 16)} → ${kline.window?.end?.slice(5, 16)}`),
-                  h('span', null, `ATR14 ${kline.atr14 ?? '—'}`),
-                  h('span', null, `EMA20 ${kline.ema20Last ?? '—'}`),
-                  kline.warning ? h('span', { className: 'tc-warn-text' }, kline.warning) : null) : null,
-                h('div', { className: 'tc-muted tc-kline-note' }, 'K 线不在盘中实时轮询：打开面板按缓存补拉，每个时段结束后再拉一次；可点「刷新」。'))
-            : null,
-          state && tab === 'rules'
-            ? h(RulesPanel, { rules, setRules, onSearch: submitSearch, onOpenSection: openSection, account: state.account })
-            : null,
-          state && tab === 'trades'
-            ? h(TradesPanel, {
-                state, form, setForm, formError, saving, onSubmit: submitTrade, symbol,
-                confirmId, onDelete: deleteTrade, onConfirmDraft: confirmDraft, onDiscardDraft: discardDraft,
-              })
-            : null,
-          state && tab === 'decision'
-            ? h(DecisionPanel, { state, decision, setDecision })
-            : null,
-        ),
+            h('span', { className: 'tc-logo' }),
+            h('b', null, '交易中控台')),
+          h('div', { className: 'tc-top-actions' },
+            h('input', {
+              className: 'tc-mini-input', type: 'date', value: day || '',
+              onChange: (event) => {
+                const value = event.target.value;
+                setDay(value);
+                if (value) void loadAll(value, symbol, false);
+              },
+            }),
+            h('button', {
+              className: 'tc-act', onClick: () => setPalette((value) => (value === 'intl' ? 'cn' : 'intl')),
+              title: '切换涨跌配色（国际：绿涨红跌 / 国内：红涨绿跌）',
+            }, palette === 'intl' ? '涨绿' : '涨红'),
+            h('button', { className: 'tc-act', onClick: refreshAll, disabled: loading }, loading ? '刷新中…' : '刷新'))),
+        h('div', { className: 'tc-board' },
+          error ? h('div', { className: 'tc-inline-error' }, error, h('button', { className: 'tc-btn tc-btn-sm', onClick: refreshAll }, '重试')) : null,
+          loading && !state ? h('div', { className: 'tc-empty-line' }, '正在加载…') : null,
+          state
+            ? h('div', { className: 'tc-stack' },
+                h(KpiCard, { summary, session, trades, symbol, price, clock, day, live }),
+                h('div', { className: 'tc-row-two' },
+                  h(MixPanel, { stats, trades, onManage: () => setDictOpen('error') }),
+                  h(GatePanel, { summary, session, symbol, trades, live })),
+                h(ChartPanel, {
+                  kline, trades, symbol, symbols: symbolOptions, klineType, loading: klineLoading, error: klineError,
+                  onSymbol: changeSymbol, onChangeType: changeKlineType,
+                }),
+                h(TradesPanel2, {
+                  trades, symbol, onDelete: deleteTrade, confirmId,
+                  onAdd: () => { setForm(emptyForm(symbol)); setFormError(''); setAddOpen(true); },
+                }),
+                h('section', { className: 'tc-mod' },
+                  h('div', { className: 'tc-mod-head' },
+                    h('span', { className: 'tc-num' }, '05'),
+                    h('h2', null, '执行手册'),
+                    h('span', { className: 'tc-aside' }, state.manual ? `${state.manual.sectionCount} 节 · ${state.manual.lineCount} 行` : '')),
+                  h(RulesPanel, { rules, setRules, onSearch: submitSearch, onOpenSection: openSection, account: state.account })),
+                h('section', { className: 'tc-mod' },
+                  h('div', { className: 'tc-mod-head' },
+                    h('span', { className: 'tc-num' }, '06'),
+                    h('h2', null, '决策')),
+                  h(DecisionPanel, { state, decision, setDecision })))
+            : null),
+        h(AddTradeDialog, {
+          open: addOpen, onClose: () => setAddOpen(false), form, setForm, onSubmit: submitTrade,
+          saving, formError, drafts, onConfirmDraft: confirmDraft, onDiscardDraft: discardDraft,
+          symbol, symbols: symbolOptions, dict, onManageDict: setDictOpen, onUploadShot: uploadShot, uploading,
+        }),
+        h(DictDialog, {
+          open: dictOpen !== null, kind: dictOpen, onClose: () => setDictOpen(null), dict, stats, onChanged: refreshDict,
+        }),
         h(Toast, { toast }));
     }
 
@@ -941,153 +1520,285 @@ window.__ModuleLoader__.load({
     // styles
     // ---------------------------------------------------------------------
     const CSS = `
-.tc-root { height: 100%; min-height: 0; display: flex; flex-direction: column; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); overflow: hidden; }
-.tc-header { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-end; padding: 18px 22px 12px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
-.tc-brand { display: flex; gap: 10px; align-items: center; min-width: 210px; }
-.tc-logo { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; border-radius: 10px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-brand-primary); font-size: 20px; }
-.tc-title { font-size: 17px; font-weight: 650; letter-spacing: .02em; }
-.tc-subtitle { color: var(--dsw-alias-label-secondary); font-size: 11px; margin-top: 2px; }
-.tc-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.tc-inline-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
-.tc-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
-.tc-stat { display: flex; flex-direction: column; gap: 2px; min-width: 78px; padding: 6px 10px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 9px; background: var(--dsw-alias-bg-layer-1); }
-.tc-stat-label { font-size: 10px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
-.tc-stat-value { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
-.tc-stat-ok .tc-stat-value { color: var(--dsw-alias-state-success-primary); }
-.tc-stat-warn .tc-stat-value { color: var(--dsw-alias-state-warn-primary); }
-.tc-stat-error .tc-stat-value { color: var(--dsw-alias-state-error-primary); }
-.tc-guards { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 22px; background: var(--dsw-alias-bg-layer-1); border-bottom: 1px solid var(--dsw-alias-border-l1); }
-.tc-guard { font-size: 11px; padding: 3px 8px; border-radius: 999px; color: var(--dsw-alias-state-warn-primary); background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); }
-.tc-tabs { display: flex; gap: 2px; padding: 0 22px; border-bottom: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
-.tc-tab { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); padding: 10px 14px; font: inherit; font-size: 13px; cursor: pointer; border-bottom: 2px solid transparent; }
-.tc-tab.is-active { color: var(--dsw-alias-brand-primary); border-bottom-color: var(--dsw-alias-brand-primary); }
-.tc-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 22px 36px; }
-.tc-card { border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); border-radius: 12px; padding: 14px 16px; min-width: 0; }
-.tc-card-title { font-weight: 650; font-size: 13px; margin-bottom: 8px; }
-.tc-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.tc-muted { color: var(--dsw-alias-label-secondary); font-size: 11px; }
-.tc-btn { border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); border-radius: 8px; padding: 6px 11px; font: inherit; font-size: 12px; cursor: pointer; }
-.tc-btn:hover { border-color: var(--dsw-alias-brand-primary); }
-.tc-btn:disabled { opacity: .55; cursor: default; }
-.tc-btn-primary { background: var(--dsw-alias-brand-primary); color: var(--dsw-alias-bg-base); border-color: transparent; }
-.tc-btn-danger { color: var(--dsw-alias-state-error-primary); }
-.tc-input, .tc-select, .tc-textarea { border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); border-radius: 7px; padding: 5px 8px; font: inherit; font-size: 12px; min-height: 28px; }
-.tc-input:focus, .tc-select:focus, .tc-textarea:focus { outline: 1px solid var(--dsw-alias-brand-primary); border-color: transparent; }
-.tc-textarea { resize: vertical; }
-.tc-empty { padding: 34px 18px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 12px; border: 1px dashed var(--dsw-alias-border-l1); border-radius: 10px; }
-.tc-error { margin: 8px 0; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); font-size: 12px; white-space: pre-wrap; }
-.tc-warn-text { color: var(--dsw-alias-state-warn-primary); font-size: 11px; margin-top: 4px; }
-.tc-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 1px 7px; font-size: 10px; font-weight: 600; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); }
-.tc-badge-ok { color: var(--dsw-alias-state-success-primary); }
-.tc-badge-error { color: var(--dsw-alias-state-error-primary); }
-.tc-badge-warn { color: var(--dsw-alias-state-warn-primary); }
-.tc-toast { position: sticky; bottom: 12px; margin: 10px 22px 0; padding: 9px 12px; border-radius: 9px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-overlay); color: var(--dsw-alias-label-primary); font-size: 12px; white-space: pre-wrap; box-shadow: 0 6px 18px rgba(0,0,0,.18); z-index: 5; }
-.tc-toast-error { border-color: var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); }
-.tc-kline { display: flex; flex-direction: column; gap: 10px; }
-.tc-kline-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.tc-segmented { display: inline-flex; border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; overflow: hidden; }
-.tc-seg { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); padding: 5px 10px; font: inherit; font-size: 11px; cursor: pointer; }
-.tc-seg.is-active { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
-.tc-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 10px; color: var(--dsw-alias-label-secondary); }
-.tc-legend-item { display: inline-flex; align-items: center; gap: 4px; }
-.tc-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.tc-dot-entry { background: var(--dsw-alias-state-success-primary); }
-.tc-dot-exit { background: var(--dsw-alias-label-primary); }
-.tc-dot-stop { background: var(--dsw-alias-state-error-primary); }
-.tc-dot-target { background: var(--dsw-alias-state-success-primary); opacity: .45; }
-.tc-dot-ema { background: var(--dsw-alias-brand-primary); }
-.tc-chart-wrap { border: 1px solid var(--dsw-alias-border-l1); border-radius: 12px; background: var(--dsw-alias-bg-layer-1); padding: 6px; overflow-x: auto; }
-.tc-chart { width: 100%; min-width: 720px; height: auto; display: block; }
-.tc-kline-meta { display: flex; flex-wrap: wrap; gap: 14px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
-.tc-kline-note { line-height: 1.5; }
-.tc-rules { display: grid; grid-template-columns: minmax(200px, 270px) minmax(0, 1fr); gap: 14px; align-items: start; }
-.tc-outline-list { display: flex; flex-direction: column; gap: 2px; max-height: 64vh; overflow: auto; }
-.tc-outline-item { display: flex; justify-content: space-between; gap: 8px; border: 0; background: transparent; color: var(--dsw-alias-label-primary); text-align: left; padding: 5px 7px; border-radius: 6px; font: inherit; font-size: 11px; cursor: pointer; }
-.tc-outline-item:hover, .tc-outline-item.is-active { background: var(--dsw-alias-bg-layer-2); }
-.tc-outline-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tc-outline-line { color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
-.tc-rule-main { min-height: 300px; }
-.tc-search { display: flex; gap: 8px; margin-bottom: 12px; }
-.tc-search-input { flex: 1; }
-.tc-rule-section-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 8px; }
-.tc-rule-section-title { font-size: 14px; font-weight: 650; margin-bottom: 3px; }
-.tc-code { max-height: 62vh; overflow: auto; border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; background: var(--dsw-alias-bg-base); padding: 8px 0; }
-.tc-code-line { display: flex; gap: 10px; padding: 1px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.55; }
-.tc-line-no { flex: 0 0 38px; text-align: right; color: var(--dsw-alias-label-secondary); opacity: .7; user-select: none; }
-.tc-code-text { white-space: pre-wrap; word-break: break-word; }
-.tc-rule-results { display: flex; flex-direction: column; gap: 6px; }
-.tc-result-count { margin-bottom: 2px; }
-.tc-rule-result { text-align: left; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-base); color: inherit; border-radius: 8px; padding: 8px 10px; font: inherit; cursor: pointer; }
-.tc-rule-result:hover { border-color: var(--dsw-alias-brand-primary); }
-.tc-rule-result-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
-.tc-rule-snippet { color: var(--dsw-alias-label-secondary); font-size: 11px; margin-top: 4px; line-height: 1.5; }
-.tc-quick-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; margin: 10px 0 14px; }
-.tc-quick-card { border: 1px solid var(--dsw-alias-border-l1); border-radius: 9px; padding: 9px 10px; background: var(--dsw-alias-bg-base); display: flex; flex-direction: column; gap: 3px; }
-.tc-quick-label { font-size: 10px; color: var(--dsw-alias-label-secondary); }
-.tc-quick-value { font-size: 12px; line-height: 1.45; }
-.tc-trades { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(300px, .9fr); gap: 14px; align-items: start; }
-.tc-summary-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); gap: 6px; margin: 8px 0 10px; }
-.tc-summary-row .tc-stat { min-width: 0; padding: 5px 7px; }
-.tc-summary-row .tc-stat-value { font-size: 13px; }
-.tc-trade-items { display: flex; flex-direction: column; gap: 7px; }
-.tc-trade { border: 1px solid var(--dsw-alias-border-l1); border-left: 3px solid var(--dsw-alias-state-idle-primary); border-radius: 8px; padding: 8px 10px; background: var(--dsw-alias-bg-base); }
-.tc-trade.is-long { border-left-color: var(--dsw-alias-state-success-primary); }
-.tc-trade.is-short { border-left-color: var(--dsw-alias-state-error-primary); }
-.tc-trade-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
-.tc-trade-title { display: flex; gap: 6px; align-items: center; font-size: 12px; }
-.tc-trade-prices { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 5px; font-variant-numeric: tabular-nums; }
-.tc-trade-foot { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; font-size: 11px; }
-.tc-pnl { font-weight: 650; }
-.tc-pnl.is-ok { color: var(--dsw-alias-state-success-primary); }
-.tc-pnl.is-error { color: var(--dsw-alias-state-error-primary); }
-.tc-drafts { margin-top: 14px; border-top: 1px dashed var(--dsw-alias-border-l1); padding-top: 10px; }
-.tc-drafts-title { color: var(--dsw-alias-state-warn-primary); }
-.tc-draft { border: 1px solid var(--dsw-alias-state-warn-primary); border-radius: 8px; padding: 8px 10px; margin-top: 7px; background: var(--dsw-alias-bg-base); }
-.tc-draft-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
-.tc-draft-prices { font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 4px; }
-.tc-draft-actions { display: flex; gap: 6px; margin-top: 7px; }
-.tc-draft-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 8px; margin-top: 6px; }
-.tc-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
-.tc-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.tc-field-label { font-size: 10px; color: var(--dsw-alias-label-secondary); }
-.tc-field-wide { margin-top: 8px; }
-.tc-form-actions { display: flex; gap: 8px; margin-top: 10px; }
-.tc-form-hint { margin-top: 8px; line-height: 1.5; }
-.tc-form-error { margin-top: 8px; }
-.tc-decision { display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); gap: 14px; align-items: start; }
-.tc-decision-inputs { display: flex; flex-direction: column; gap: 8px; }
-.tc-toggle { display: inline-flex; border: 1px solid var(--dsw-alias-border-l2); border-radius: 7px; overflow: hidden; width: fit-content; }
-.tc-toggle-btn { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); padding: 4px 10px; font: inherit; font-size: 11px; cursor: pointer; }
-.tc-toggle-btn.is-on { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
-.tc-flow { display: flex; flex-direction: column; gap: 4px; max-width: 780px; }
-.tc-node { border: 1px solid var(--dsw-alias-border-l1); border-left: 3px solid var(--dsw-alias-state-idle-primary); border-radius: 9px; padding: 9px 11px; background: var(--dsw-alias-bg-layer-1); }
-.tc-node.is-pass { border-left-color: var(--dsw-alias-state-success-primary); }
-.tc-node.is-fail { border-left-color: var(--dsw-alias-state-error-primary); }
-.tc-node.is-info { border-left-color: var(--dsw-alias-brand-primary); }
-.tc-node-title { font-size: 12px; font-weight: 650; margin-bottom: 4px; }
-.tc-node-detail { font-size: 11px; color: var(--dsw-alias-label-secondary); line-height: 1.5; }
-.tc-node-list { margin: 0 0 4px 18px; padding: 0; font-size: 11px; color: var(--dsw-alias-state-error-primary); }
-.tc-branch { margin-top: 5px; font-size: 10px; color: var(--dsw-alias-label-secondary); }
-.tc-arrow { text-align: center; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 1; }
-.tc-checks { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
-.tc-check { display: flex; align-items: center; gap: 7px; font-size: 11px; padding: 3px 5px; border-radius: 5px; background: var(--dsw-alias-bg-base); }
-.tc-check-mark { width: 14px; font-weight: 700; }
-.tc-check.is-pass .tc-check-mark { color: var(--dsw-alias-state-success-primary); }
-.tc-check.is-fail .tc-check-mark { color: var(--dsw-alias-state-error-primary); }
-.tc-check-branch { margin-left: auto; color: var(--dsw-alias-label-secondary); font-size: 10px; }
-.tc-verdict { border-radius: 12px; padding: 14px 16px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
-.tc-verdict.is-ok { border-color: var(--dsw-alias-state-success-primary); }
-.tc-verdict.is-warn { border-color: var(--dsw-alias-state-warn-primary); }
-.tc-verdict.is-error { border-color: var(--dsw-alias-state-error-primary); }
-.tc-verdict-label { font-size: 10px; color: var(--dsw-alias-label-secondary); }
-.tc-verdict-value { font-size: 26px; font-weight: 750; margin: 2px 0 4px; }
-.tc-verdict.is-ok .tc-verdict-value { color: var(--dsw-alias-state-success-primary); }
-.tc-verdict.is-warn .tc-verdict-value { color: var(--dsw-alias-state-warn-primary); }
-.tc-verdict.is-error .tc-verdict-value { color: var(--dsw-alias-state-error-primary); }
-.tc-verdict-detail { font-size: 11px; color: var(--dsw-alias-label-secondary); line-height: 1.5; }
-.tc-refs { margin-top: 8px; line-height: 1.6; }
-@media (max-width: 980px) { .tc-rules, .tc-trades, .tc-decision { grid-template-columns: 1fr; } .tc-stats { margin-left: 0; } }
-@media (max-width: 640px) { .tc-header { padding: 14px; } .tc-body { padding: 12px 14px 30px; } .tc-tabs { padding: 0 14px; } .tc-form-grid, .tc-draft-grid { grid-template-columns: 1fr; } .tc-toast { margin: 8px 14px 0; } }
+.tc-root{height:100%;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);overflow:auto;font-size:13px;line-height:1.55}
+.tc-root *{box-sizing:border-box}
+.tc-top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;height:48px;padding:0 20px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
+.tc-brand{display:flex;align-items:center;gap:8px;font-size:13px}
+.tc-brand b{font-weight:600;letter-spacing:.01em}
+.tc-logo{width:14px;height:14px;background:var(--dsw-alias-label-primary);position:relative;display:inline-block}
+.tc-logo::after{content:"";position:absolute;inset:3px;background:var(--dsw-alias-bg-layer-1)}
+.tc-top-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
+.tc-act{height:28px;padding:0 12px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:inherit;cursor:pointer;transition:border-color .15s,color .15s}
+.tc-act:hover:not(:disabled){border-color:var(--dsw-alias-label-primary)}
+.tc-act:disabled{opacity:.5;cursor:default}
+.tc-board{flex:1;min-height:0;padding:22px 24px 60px}
+.tc-stack{display:flex;flex-direction:column;gap:20px;max-width:1180px;margin:0 auto}
+.tc-mod{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);animation:tcRise .4s cubic-bezier(.2,.7,.3,1)}
+.tc-mod{display:flex;flex-direction:column}
+.tc-mod-head{display:flex;align-items:center;gap:10px;padding:0 16px;height:44px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-num{font:10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.14em;color:var(--dsw-alias-label-secondary)}
+.tc-mod-head h2{margin:0;font-size:13.5px;font-weight:600;letter-spacing:.01em}
+.tc-aside{margin-left:auto;font-size:11px;color:var(--dsw-alias-label-secondary)}
+.tc-aside.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.02em}
+.tc-mod-action{margin-left:auto}
+.tc-mod-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;border-top:1px solid var(--dsw-alias-border-l1);font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+.tc-row-two{display:flex;gap:20px;align-items:stretch}
+.tc-row-two>.tc-mod{flex:1 1 0;min-width:0}
+.tc-row-two>.tc-mod:first-child{flex:1 1 auto}
+.tc-row-two>.tc-mod:last-child{flex:0 0 430px}
+@keyframes tcRise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* KPI */
+.tc-stat-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.tc-stamp{display:flex;align-items:center;gap:8px;font:11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.1em;color:var(--dsw-alias-label-secondary)}
+.tc-stamp b{font-weight:500;color:var(--dsw-alias-label-primary)}
+.tc-stamp i{font-style:normal;opacity:.45}
+.tc-stamp-r{font:10.5px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary);letter-spacing:.04em;white-space:nowrap}
+.tc-kpis{display:grid;grid-template-columns:repeat(4,1fr)}
+.tc-kpi-cell{display:flex;flex-direction:column;gap:6px;padding:14px 16px 16px;border-right:1px solid var(--dsw-alias-border-l1)}
+.tc-kpi-cell:last-child{border-right:0}
+.tc-kpi-label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.tc-kpi-value{font-size:25px;font-weight:300;line-height:1.1;letter-spacing:-.01em}
+.tc-kpi-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:400}
+.tc-kpi-sub{font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+.is-up{color:var(--tc-up,var(--dsw-alias-state-success-primary))}
+.is-down{color:var(--tc-down,var(--dsw-alias-state-error-primary))}
+
+/* mix */
+.tc-mix{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));grid-auto-rows:1fr;flex:1;align-content:stretch}
+.tc-mix-cell{display:flex;align-items:baseline;gap:9px;padding:13px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);border-right:1px solid var(--dsw-alias-border-l1)}
+.tc-mix-code{font:12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.06em;color:var(--dsw-alias-state-error-primary)}
+.tc-mix-note{font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.tc-mix-count{margin-left:auto;font:13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600}
+
+/* gate */
+.tc-gate{display:flex;flex-direction:column}
+.tc-gate-verdict{display:flex;flex-direction:column;gap:6px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-gate-verdict-label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.tc-gate-word{font-size:30px;font-weight:300;line-height:1.05;letter-spacing:-.02em}
+.tc-gate-word.is-no{color:inherit}
+.tc-gate-why{margin:0;font-size:12.5px;color:var(--dsw-alias-label-secondary);line-height:1.6}
+.tc-gate-meta{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary)}
+.tc-gate-checks{display:flex;flex-direction:column}
+.tc-gate-check{display:grid;grid-template-columns:24px minmax(0,1fr) auto 40px;align-items:center;gap:10px;padding:7px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12.5px}
+.tc-gate-check:last-child{border-bottom:0}
+.tc-gate-check.is-bad{background:var(--dsw-alias-bg-layer-2)}
+.tc-gate-id{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary)}
+.tc-gate-value{font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary)}
+.tc-gate-state{text-align:right;font-size:11px;color:var(--dsw-alias-state-success-primary)}
+.tc-gate-check.is-bad .tc-gate-state{color:var(--dsw-alias-state-error-primary)}
+
+/* chart */
+.tc-chart-bar{display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-seg{display:flex;border:1px solid var(--dsw-alias-border-l2)}
+.tc-seg-btn{height:24px;padding:0 10px;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer}
+.tc-seg-btn.is-on{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-1)}
+.tc-legend{display:flex;align-items:center;gap:12px;font-size:11px;color:var(--dsw-alias-label-secondary)}
+.tc-legend span{display:inline-flex;align-items:center;gap:5px}
+.tc-sw{width:9px;height:9px;display:inline-block;border:1px solid var(--dsw-alias-border-l2)}
+.tc-sw.is-up{background:var(--tc-up,var(--dsw-alias-state-success-primary));border-color:transparent}
+.tc-sw.is-down{background:var(--tc-down,var(--dsw-alias-state-error-primary));border-color:transparent}
+.tc-sw.is-ema{background:var(--dsw-alias-label-secondary);border-color:transparent;opacity:.5}
+.tc-sw.is-stop{border-color:var(--dsw-alias-state-error-primary);border-style:dashed}
+.tc-sw.is-target{border-color:var(--dsw-alias-state-success-primary);border-style:dashed}
+.tc-chart-body{padding:10px 12px 4px}
+.tc-chart-wrap{position:relative;width:100%}
+.tc-chart svg{display:block;width:100%;height:auto}
+.tc-mini-select,.tc-mini-input{height:26px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}
+.tc-mini-input::placeholder{color:var(--dsw-alias-label-secondary);letter-spacing:0}
+.tc-mini-select:focus,.tc-mini-input:focus{border-color:var(--dsw-alias-label-primary)}
+
+/* trades table */
+.tc-filters{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-filters .tc-mini-input{flex:1 1 160px;min-width:90px;font-family:inherit;font-size:12px}
+.tc-table{display:flex;flex-direction:column}
+.tc-tr{display:grid;grid-template-columns:62px 54px 32px 62px 44px 72px 38px 52px 52px 76px minmax(0,1fr) 30px;align-items:center;gap:8px;padding:9px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12.5px}
+.tc-tr.is-head{height:30px;padding-top:0;padding-bottom:0;font-size:10px;letter-spacing:.1em;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);text-transform:uppercase}
+.tc-tr:last-child{border-bottom:0}
+.tc-tr .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.tc-tr .tc-errs{font-size:10.5px;letter-spacing:.04em;color:var(--dsw-alias-state-error-primary)}
+.tc-dir{font-size:11px}
+.tc-dir.is-long{color:var(--tc-up,var(--dsw-alias-state-success-primary))}
+.tc-dir.is-short{color:var(--tc-down,var(--dsw-alias-state-error-primary))}
+.tc-tag{display:inline-block;padding:1px 5px;border:1px solid var(--dsw-alias-border-l2);font-size:10.5px;font-style:normal;color:var(--dsw-alias-label-secondary)}
+.tc-tag.is-live{border-color:var(--dsw-alias-label-primary);color:var(--dsw-alias-label-primary)}
+.tc-note{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:12px}
+.tc-icon-btn{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;cursor:pointer;line-height:1}
+.tc-icon-btn:hover{border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-state-error-primary)}
+.tc-pager{display:flex;align-items:center;gap:6px}
+.tc-page-btn{width:24px;height:22px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;cursor:pointer;font-size:12px;line-height:1}
+.tc-page-btn:disabled{opacity:.35;cursor:default}
+
+/* forms + dialog */
+.tc-btn{height:30px;padding:0 12px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer;transition:border-color .15s,background .15s}
+.tc-btn:hover:not(:disabled){border-color:var(--dsw-alias-label-primary)}
+.tc-btn-sm{height:26px;padding:0 10px;font-size:11.5px}
+.tc-btn-primary{background:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-1)}
+.tc-btn-primary:hover:not(:disabled){opacity:.88}
+.tc-btn:disabled{opacity:.5;cursor:default}
+.tc-field{display:flex;flex-direction:column;gap:5px}
+.tc-field-label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.tc-field-wide{grid-column:1 / -1}
+.tc-input{height:30px;padding:0 9px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:inherit;font-size:12.5px;outline:none;width:100%}
+textarea.tc-input{height:auto;padding:7px 9px;resize:vertical;line-height:1.5}
+.tc-input:focus{border-color:var(--dsw-alias-label-primary)}
+.tc-form{padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.tc-form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}
+.tc-errs-row{display:flex;flex-direction:column;gap:6px}
+.tc-chip-row{display:flex;flex-wrap:wrap;gap:6px}
+.tc-chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 4px 0 8px;border:1px solid var(--dsw-alias-border-l2);font:11px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em}
+.tc-chip-x{border:0;background:transparent;color:inherit;cursor:pointer;font-size:12px;line-height:1;padding:2px 4px}
+.tc-chip-x:hover{color:var(--dsw-alias-state-error-primary)}
+.tc-form-actions{display:flex;gap:8px;align-items:center}
+.tc-dlg{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:24px;background:color-mix(in srgb,var(--dsw-alias-bg-base) 62%,#000)}
+.tc-dlg-box{width:min(620px,100%);max-height:82vh;display:flex;flex-direction:column;border:1px solid var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);box-shadow:0 24px 60px rgba(0,0,0,.18)}
+.tc-dlg-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-dlg-head h3{margin:0;font-size:13.5px;font-weight:600}
+.tc-dlg-head .tc-aside{margin-left:auto}
+.tc-dlg-box .tc-form{overflow:auto;min-height:0}
+.tc-sub-head{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--dsw-alias-border-l1);border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.tc-sub-head h3{margin:0;font-size:12px;font-weight:600}
+.tc-draft-block{overflow:auto;min-height:0}
+
+/* legacy panels (手册 / 决策 / 草稿) */
+.tc-card{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);padding:12px 14px}
+.tc-card-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.tc-card-title{font-size:12.5px;font-weight:600;letter-spacing:.01em}
+.tc-muted{font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+.tc-rules,.tc-trades,.tc-decision{display:flex;flex-direction:column;gap:12px;padding:14px 16px}
+.tc-tr{display:grid;grid-template-columns:62px 54px 32px 62px 44px 72px 38px 52px 52px 76px minmax(0,1fr) 30px;align-items:center;gap:8px;padding:9px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12.5px}
+.tc-tr.is-head{height:30px;padding-top:0;padding-bottom:0;font-size:10px;letter-spacing:.1em;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);text-transform:uppercase}
+.tc-tr:last-child{border-bottom:0}
+.tc-tr .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.tc-tr .tc-errs{font-size:10.5px;letter-spacing:.04em;color:var(--dsw-alias-state-error-primary)}
+.tc-dir{font-size:11px}
+.tc-dir.is-long{color:var(--tc-up,var(--dsw-alias-state-success-primary))}
+.tc-dir.is-short{color:var(--tc-down,var(--dsw-alias-state-error-primary))}
+.tc-tag{display:inline-block;padding:1px 5px;border:1px solid var(--dsw-alias-border-l2);font-size:10.5px;font-style:normal;color:var(--dsw-alias-label-secondary)}
+.tc-tag.is-live{border-color:var(--dsw-alias-label-primary);color:var(--dsw-alias-label-primary)}
+.tc-note{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:12px}
+.tc-icon-btn{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;cursor:pointer;line-height:1}
+.tc-icon-btn:hover{border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-state-error-primary)}
+.tc-pager{display:flex;align-items:center;gap:6px}
+.tc-page-btn{width:24px;height:22px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;cursor:pointer;font-size:12px;line-height:1}
+.tc-page-btn:disabled{opacity:.35;cursor:default}
+
+/* forms + dialog */
+.tc-btn{height:30px;padding:0 12px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer;transition:border-color .15s,background .15s}
+.tc-btn:hover:not(:disabled){border-color:var(--dsw-alias-label-primary)}
+.tc-btn-sm{height:26px;padding:0 10px;font-size:11.5px}
+.tc-btn-primary{background:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-1)}
+.tc-btn-primary:hover:not(:disabled){opacity:.88}
+.tc-btn:disabled{opacity:.5;cursor:default}
+.tc-field{display:flex;flex-direction:column;gap:5px}
+.tc-field-label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.tc-field-wide{grid-column:1 / -1}
+.tc-input{height:30px;padding:0 9px;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:inherit;font-size:12.5px;outline:none;width:100%}
+textarea.tc-input{height:auto;padding:7px 9px;resize:vertical;line-height:1.5}
+.tc-input:focus{border-color:var(--dsw-alias-label-primary)}
+.tc-form{padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.tc-form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}
+.tc-form-actions{display:flex;gap:8px;align-items:center}
+.tc-dlg{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:24px;background:color-mix(in srgb,var(--dsw-alias-bg-base) 62%,#000)}
+.tc-dlg-box{width:min(620px,100%);max-height:82vh;display:flex;flex-direction:column;border:1px solid var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);box-shadow:0 24px 60px rgba(0,0,0,.18)}
+.tc-dlg-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-dlg-head h3{margin:0;font-size:13.5px;font-weight:600}
+.tc-dlg-head .tc-aside{margin-left:auto}
+.tc-dlg-box .tc-form{overflow:auto;min-height:0}
+.tc-sub-head{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--dsw-alias-border-l1);border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.tc-sub-head h3{margin:0;font-size:12px;font-weight:600}
+.tc-draft-block{overflow:auto;min-height:0}
+
+/* legacy panels (手册 / 决策 / 草稿) */
+.tc-card{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);padding:12px 14px}
+.tc-card-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.tc-card-title{font-size:12.5px;font-weight:600;letter-spacing:.01em}
+.tc-muted{font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+.tc-search{display:flex;gap:8px}
+.tc-search-input{flex:1}
+.tc-rule-results{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow:auto}
+.tc-rule-result{border:1px solid var(--dsw-alias-border-l1);padding:8px 10px;cursor:pointer}
+.tc-rule-result:hover{border-color:var(--dsw-alias-label-primary)}
+.tc-rule-result-head{display:flex;justify-content:space-between;gap:10px;font-size:12px}
+.tc-rule-snippet{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:4px}
+.tc-outline-list{display:flex;flex-direction:column;gap:4px;max-height:260px;overflow:auto}
+.tc-outline-line{display:flex;gap:10px;font-size:12px;padding:3px 0;cursor:pointer}
+.tc-outline-title:hover{text-decoration:underline}
+.tc-code-line{display:flex;gap:10px;font:11.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace}
+.tc-line-no{width:34px;color:var(--dsw-alias-label-secondary);text-align:right;flex:0 0 auto}
+.tc-code-text{white-space:pre-wrap}
+.tc-empty,.tc-empty-line{padding:16px;color:var(--dsw-alias-label-secondary);font-size:12.5px;text-align:center}
+.tc-inline-error{padding:10px 16px;font-size:12px;color:var(--dsw-alias-state-error-primary);border-bottom:1px solid var(--dsw-alias-border-l1)}
+.tc-inline-warn{padding:8px 16px;font-size:11.5px;color:var(--dsw-alias-state-warn-primary);border-top:1px solid var(--dsw-alias-border-l1)}
+.tc-toast{position:fixed;right:18px;bottom:18px;z-index:90;max-width:420px;padding:10px 14px;border:1px solid var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-overlay);font-size:12.5px;white-space:pre-wrap;box-shadow:0 12px 30px rgba(0,0,0,.16)}
+.tc-toggle{display:flex;gap:6px}
+.tc-quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.tc-quick-card{border:1px solid var(--dsw-alias-border-l1);padding:8px 10px}
+.tc-quick-label{font-size:10px;letter-spacing:.1em;color:var(--dsw-alias-label-secondary);text-transform:uppercase}
+.tc-quick-value{font-size:13px}
+.tc-draft{border:1px solid var(--dsw-alias-border-l1);padding:10px 12px;margin:10px 16px}
+.tc-draft-head{display:flex;justify-content:space-between;gap:10px;font-size:12px}
+.tc-draft-prices{display:flex;gap:14px;font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary);margin-top:4px}
+.tc-draft-actions{display:flex;gap:8px;margin-top:8px}
+.tc-decision .tc-verdict-value{font-size:22px;font-weight:300}
+.tc-flow{display:flex;flex-direction:column;gap:2px}
+.tc-node{padding:6px 10px;border:1px solid var(--dsw-alias-border-l1);font-size:12px}
+.tc-check-mark{font-size:11px;color:var(--dsw-alias-label-secondary)}
+
+/* palette + misc */
+.tc-root{--tc-up:var(--dsw-alias-state-success-primary);--tc-down:var(--dsw-alias-state-error-primary)}
+.tc-root[data-palette="cn"]{--tc-up:var(--dsw-alias-state-error-primary);--tc-down:var(--dsw-alias-state-success-primary)}
+.tc-mix-today{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em;color:var(--dsw-alias-brand-primary);border:1px solid var(--dsw-alias-border-l2);padding:0 4px}
+.tc-link{margin-left:6px;border:0;background:transparent;color:var(--dsw-alias-brand-primary);font:10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em;cursor:pointer;padding:0}
+.tc-link:hover{text-decoration:underline}
+
+/* screenshot */
+.tc-shot-drop{height:62px;border:1px dashed var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:11.5px;line-height:1.4;cursor:pointer;padding:0 12px}
+.tc-shot-drop:hover{border-color:var(--dsw-alias-label-primary);color:var(--dsw-alias-label-primary)}
+.tc-shot-drop.is-busy{cursor:progress;opacity:.6}
+.tc-shot-row{display:flex;align-items:center;gap:10px}
+.tc-shot-thumb{width:52px;height:52px;object-fit:cover;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2)}
+
+/* dictionary */
+.tc-dict-box{width:min(580px,100%)}
+.tc-dict-list{overflow:auto;min-height:0;max-height:46vh}
+.tc-dict-row{display:grid;grid-template-columns:84px minmax(0,1fr) 54px 24px;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12.5px}
+.tc-dict-row:last-child{border-bottom:0}
+.tc-dict-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.tc-dict-label{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tc-dict-count{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--dsw-alias-label-secondary);text-align:right}
+.tc-dict-add{display:grid;grid-template-columns:110px minmax(0,1fr) auto;gap:8px;padding:12px 16px;border-top:1px solid var(--dsw-alias-border-l1)}
+.tc-dict-hint{padding:0 16px 14px}
+.tc-dict-extra{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:10px 16px;border-top:1px solid var(--dsw-alias-border-l1)}
+
+/* unify legacy manual / decision cards with the module board */
+.tc-mod .tc-card{border:0;background:transparent;padding:0}
+.tc-mod .tc-rules{display:grid;grid-template-columns:250px minmax(0,1fr);gap:0;padding:0}
+.tc-mod .tc-outline{border-right:1px solid var(--dsw-alias-border-l1);padding:14px 16px;max-height:420px;overflow:auto}
+.tc-mod .tc-rule-main{padding:14px 16px;min-width:0}
+.tc-mod .tc-decision{display:grid;grid-template-columns:340px minmax(0,1fr);gap:0;padding:0}
+.tc-mod .tc-decision>.tc-card{border-right:1px solid var(--dsw-alias-border-l1);padding:14px 16px}
+.tc-mod .tc-decision>.tc-flow{padding:14px 16px;min-width:0}
+.tc-mod .tc-card-title{margin-bottom:8px}
+
+@media (max-width:1080px){
+  .tc-row-two{flex-direction:column}
+  .tc-row-two>.tc-mod:last-child{flex:none}
+  .tc-kpis{grid-template-columns:repeat(2,1fr)}
+  .tc-kpi-cell:nth-child(2){border-right:0}
+  .tc-kpi-cell:nth-child(1),.tc-kpi-cell:nth-child(2){border-bottom:1px solid var(--dsw-alias-border-l1)}
+  .tc-tr{grid-template-columns:46px 22px minmax(0,1fr) 58px 44px 56px;gap:6px;font-size:12px}
+  .tc-tr .tc-note-col,.tc-tr>span:nth-child(1),.tc-tr>span:nth-child(5),.tc-tr>span:nth-child(7),.tc-tr>span:nth-child(9),.tc-tr>span:nth-child(12){display:none}
+  .tc-form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .tc-mod .tc-rules,.tc-mod .tc-decision{grid-template-columns:1fr}
+  .tc-mod .tc-outline,.tc-mod .tc-decision>.tc-card{border-right:0;border-bottom:1px solid var(--dsw-alias-border-l1);max-height:none}
+  .tc-dict-add{grid-template-columns:1fr}
+  .tc-board{padding:16px 14px 48px}
+}
+@media (prefers-reduced-motion:reduce){
+  .tc-mod{animation:none}
+}
+
 `;
 
     function ensureStyle() {
